@@ -11,6 +11,7 @@ import android.provider.MediaStore
 import android.view.Gravity
 import android.view.ViewGroup
 import android.widget.Button
+import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -27,6 +28,47 @@ class MainActivity : Activity() {
     private lateinit var output: TextView
     private var selectedUri: Uri? = null
     private var lastReport: JSONObject? = null
+
+    private lateinit var symbolSearch: EditText
+    private var lastElfSymbols: List<ElfSymbol> = emptyList()
+
+    private data class ElfSymbol(
+        val name: String,
+        val value: Long,
+        val size: Long,
+        val fileOffset: Long?,
+        val symbolType: Int,
+        val binding: Int
+    )
+
+    private data class ElfAnalysis(
+        val report: JSONObject,
+        val symbols: List<ElfSymbol>
+    )
+
+    private data class ElfSection(
+        val index: Int,
+        val nameOffset: Long,
+        val type: Long,
+        val flags: Long,
+        val address: Long,
+        val offset: Long,
+        val size: Long,
+        val link: Long,
+        val info: Long,
+        val alignment: Long,
+        val entrySize: Long
+    )
+
+    private data class ElfSegment(
+        val type: Long,
+        val flags: Long,
+        val offset: Long,
+        val virtualAddress: Long,
+        val fileSize: Long,
+        val memorySize: Long,
+        val alignment: Long
+    )
     private val pickFile = 4101
 
     private val maxSingleFileBytes = 300L * 1024L * 1024L
@@ -58,6 +100,18 @@ class MainActivity : Activity() {
         root.addView(actionButton("APK'DEN SO + METADATA ÇIKAR") { extractApkContents() })
         root.addView(actionButton("TXT RAPORU PAYLAŞ") { shareReport("txt") })
         root.addView(actionButton("JSON RAPORU PAYLAŞ") { shareReport("json") })
+        symbolSearch = EditText(this).apply {
+            hint = "Sembol adı ara (ör. JNI_OnLoad)"
+            setSingleLine(true)
+            textSize = 14f
+            setTextColor(0xFFE7EDF7.toInt())
+            setHintTextColor(0xFF8B98AA.toInt())
+        }
+        root.addView(symbolSearch, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ))
+        root.addView(actionButton("SO SEMBOLLERİNDE ARA") { searchElfSymbols() })
         output = TextView(this).apply {
             text = "Henüz dosya seçilmedi.\n\nAPK seçip içindeki .so ve global-metadata.dat dosyalarını çıkarabilirsin. Analiz yalnızca seçtiğin dosyalar ve Android'in izin verdiği içeriklerle yapılır."
             textSize = 14f
@@ -109,6 +163,8 @@ class MainActivity : Activity() {
             val name = queryName(uri)
             val bytes = contentResolver.openInputStream(uri)?.use { readBounded(it, maxAnalyzeFileBytes) }
                 ?: error("Dosya okunamadı.")
+            val elfAnalysis = if (isElf(bytes)) analyzeElf(bytes) else null
+            lastElfSymbols = elfAnalysis?.symbols ?: emptyList()
             val report = JSONObject().apply {
                 put("tool", "Dumper")
                 put("version", "0.3.0")
@@ -116,7 +172,7 @@ class MainActivity : Activity() {
                 put("sizeBytes", bytes.size)
                 put("analyzedAt", SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssXXX", Locale.US).format(Date()))
                 put("fileType", detectType(name, bytes))
-                put("elf", if (isElf(bytes)) elfInfo(bytes) else JSONObject.NULL)
+                put("elf", elfAnalysis?.report ?: JSONObject.NULL)
                 put("metadata", if (name.endsWith("global-metadata.dat", true)) metadataInfo(bytes) else JSONObject.NULL)
                 put("note", "Static file inspection only. No protected app data or live game memory is accessed.")
             }
@@ -362,24 +418,366 @@ class MainActivity : Activity() {
         b.size >= 4 && b[0] == 0x7f.toByte() && b[1] == 0x45.toByte() &&
             b[2] == 0x4c.toByte() && b[3] == 0x46.toByte()
 
-    private fun elfInfo(b: ByteArray): JSONObject {
-        val endian = if (b.size > 5) b[5].toInt() and 255 else 1
-        fun u16(o: Int): Int {
-            if (o + 1 >= b.size) return 0
-            val a = b[o].toInt() and 255
-            val z = b[o + 1].toInt() and 255
-            return if (endian == 2) (a shl 8) or z else a or (z shl 8)
+    private fun analyzeElf(b: ByteArray): ElfAnalysis {
+        fun failed(reason: String): ElfAnalysis {
+            return ElfAnalysis(JSONObject().apply {
+                put("valid", false)
+                put("error", reason)
+                put("fileSizeBytes", b.size)
+            }, emptyList())
         }
-        return JSONObject().apply {
-            put("class", when (b.getOrNull(4)?.toInt()?.and(255)) {
-                1 -> "ELF32"; 2 -> "ELF64"; else -> "Unknown"
+
+        if (b.size < 16) return failed("ELF identification header is truncated.")
+        val elfClass = b[4].toInt() and 255
+        val dataEncoding = b[5].toInt() and 255
+        if (elfClass !in 1..2) return failed("Unsupported ELF class value: " + elfClass)
+        if (dataEncoding !in 1..2) return failed("Unsupported ELF byte order value: " + dataEncoding)
+
+        val is64 = elfClass == 2
+        val littleEndian = dataEncoding == 1
+        val headerSize = if (is64) 64 else 52
+        val minSectionHeaderSize = if (is64) 64 else 40
+        val minProgramHeaderSize = if (is64) 56 else 32
+        if (b.size < headerSize) return failed("ELF header is shorter than the required " + headerSize + " bytes.")
+
+        fun readValue(offset: Long, width: Int): Long? {
+            if (offset < 0L || width !in listOf(2, 4, 8) ||
+                offset > b.size.toLong() || width.toLong() > b.size.toLong() - offset) return null
+            val start = offset.toInt()
+            var value = 0L
+            if (littleEndian) {
+                for (i in width - 1 downTo 0) {
+                    value = (value shl 8) or (b[start + i].toInt() and 255).toLong()
+                }
+            } else {
+                for (i in 0 until width) {
+                    value = (value shl 8) or (b[start + i].toInt() and 255).toLong()
+                }
+            }
+            return if (width == 8 && value < 0L) null else value
+        }
+
+        fun validRange(offset: Long, length: Long): Boolean =
+            offset >= 0L && length >= 0L &&
+                offset <= b.size.toLong() && length <= b.size.toLong() - offset
+
+        fun hex(value: Long): String = "0x" + java.lang.Long.toHexString(value).uppercase(Locale.US)
+
+        fun cString(tableOffset: Long, tableSize: Long, nameOffset: Long, maxLength: Int = 256): String {
+            if (nameOffset < 0L || nameOffset >= tableSize || !validRange(tableOffset, tableSize)) return ""
+            val begin = tableOffset + nameOffset
+            val limit = minOf(tableOffset + tableSize, begin + maxLength.toLong(), b.size.toLong())
+            var cursor = begin
+            while (cursor < limit && b[cursor.toInt()] != 0.toByte()) cursor++
+            if (cursor == begin) return ""
+            return String(b, begin.toInt(), (cursor - begin).toInt(), Charsets.UTF_8)
+        }
+
+        fun sectionTypeName(type: Long): String = when (type) {
+            0L -> "NULL"; 1L -> "PROGBITS"; 2L -> "SYMTAB"; 3L -> "STRTAB"
+            4L -> "RELA"; 5L -> "HASH"; 6L -> "DYNAMIC"; 7L -> "NOTE"
+            8L -> "NOBITS"; 9L -> "REL"; 10L -> "SHLIB"; 11L -> "DYNSYM"
+            14L -> "INIT_ARRAY"; 15L -> "FINI_ARRAY"; 16L -> "PREINIT_ARRAY"
+            17L -> "GROUP"; 18L -> "SYMTAB_SHNDX"; 0x6ffffff6L -> "GNU_HASH"
+            0x6ffffffdL -> "GNU_VERNEED"; 0x6fffffffL -> "GNU_VERSYM"
+            else -> "UNKNOWN"
+        }
+
+        fun machineName(machine: Long): String = when (machine) {
+            3L -> "x86"; 8L -> "MIPS"; 40L -> "ARM"; 62L -> "x86_64"
+            183L -> "AArch64"; 243L -> "RISC-V"; else -> "Unknown (" + machine + ")"
+        }
+
+        fun symbolTypeName(type: Int): String = when (type) {
+            0 -> "NOTYPE"; 1 -> "OBJECT"; 2 -> "FUNC"; 3 -> "SECTION"
+            4 -> "FILE"; 5 -> "COMMON"; 6 -> "TLS"; 10 -> "GNU_IFUNC"
+            else -> "UNKNOWN"
+        }
+
+        fun bindingName(binding: Int): String = when (binding) {
+            0 -> "LOCAL"; 1 -> "GLOBAL"; 2 -> "WEAK"; 10 -> "GNU_UNIQUE"
+            else -> "UNKNOWN"
+        }
+
+        val fileType = readValue(16L, 2) ?: return failed("ELF file type field is unreadable.")
+        val machine = readValue(18L, 2) ?: return failed("ELF machine field is unreadable.")
+        val entry = readValue(24L, if (is64) 8 else 4) ?: return failed("ELF entry field is invalid or too large.")
+        val programOffset = readValue(if (is64) 32L else 28L, if (is64) 8 else 4)
+            ?: return failed("ELF program-header offset is invalid.")
+        val sectionOffset = readValue(if (is64) 40L else 32L, if (is64) 8 else 4)
+            ?: return failed("ELF section-header offset is invalid.")
+        val programEntrySize = readValue(if (is64) 54L else 42L, 2) ?: 0L
+        val programCount = readValue(if (is64) 56L else 44L, 2) ?: 0L
+        val sectionEntrySize = readValue(if (is64) 58L else 46L, 2) ?: 0L
+        val sectionCount = readValue(if (is64) 60L else 48L, 2) ?: 0L
+        val sectionNameIndex = readValue(if (is64) 62L else 50L, 2) ?: 0L
+
+        if (programCount > 4096L) return failed("Program-header count exceeds the safety limit.")
+        if (sectionCount > 20000L) return failed("Section-header count exceeds the safety limit.")
+        if (programCount > 0L &&
+            (programEntrySize < minProgramHeaderSize || programOffset > b.size.toLong() ||
+                programCount > (b.size.toLong() - programOffset) / programEntrySize)) {
+            return failed("Program-header table is outside the file or has an invalid entry size.")
+        }
+        if (sectionCount > 0L &&
+            (sectionEntrySize < minSectionHeaderSize || sectionOffset > b.size.toLong() ||
+                sectionCount > (b.size.toLong() - sectionOffset) / sectionEntrySize)) {
+            return failed("Section-header table is outside the file or has an invalid entry size.")
+        }
+
+        fun readSection(index: Int): ElfSection? {
+            if (index < 0 || index.toLong() >= sectionCount) return null
+            val base = sectionOffset + index.toLong() * sectionEntrySize
+            val word = if (is64) 8 else 4
+            val name = readValue(base, 4) ?: return null
+            val type = readValue(base + 4L, 4) ?: return null
+            val flags = readValue(base + (if (is64) 8L else 8L), word) ?: return null
+            val address = readValue(base + (if (is64) 16L else 12L), word) ?: return null
+            val offset = readValue(base + (if (is64) 24L else 16L), word) ?: return null
+            val size = readValue(base + (if (is64) 32L else 20L), word) ?: return null
+            val link = readValue(base + (if (is64) 40L else 24L), 4) ?: return null
+            val info = readValue(base + (if (is64) 44L else 28L), 4) ?: return null
+            val alignment = readValue(base + (if (is64) 48L else 32L), word) ?: return null
+            val entrySize = readValue(base + (if (is64) 56L else 36L), word) ?: return null
+            return ElfSection(index, name, type, flags, address, offset, size, link, info, alignment, entrySize)
+        }
+
+        val sections = ArrayList<ElfSection>()
+        var invalidSectionCount = 0
+        for (i in 0 until sectionCount.toInt()) {
+            val section = readSection(i)
+            if (section == null) {
+                invalidSectionCount++
+            } else {
+                if (section.type != 8L && section.size > 0L &&
+                    !validRange(section.offset, section.size)) invalidSectionCount++
+                sections.add(section)
+            }
+        }
+
+        val sectionNameTable = if (sectionNameIndex in sections.indices.map { it.toLong() }) {
+            sections[sectionNameIndex.toInt()]
+        } else null
+        val sectionNameTableValid = sectionNameTable != null &&
+            sectionNameTable.type == 3L &&
+            validRange(sectionNameTable.offset, sectionNameTable.size)
+
+        val namedSections = JSONArray()
+        val sectionNameByIndex = HashMap<Int, String>()
+        for (section in sections) {
+            val name = if (sectionNameTableValid) {
+                cString(sectionNameTable!!.offset, sectionNameTable.size, section.nameOffset)
+            } else ""
+            sectionNameByIndex[section.index] = name
+            if (namedSections.length() < 250) {
+                namedSections.put(JSONObject().apply {
+                    put("index", section.index)
+                    put("name", name)
+                    put("type", sectionTypeName(section.type))
+                    put("typeValue", section.type)
+                    put("flagsHex", hex(section.flags))
+                    put("virtualAddress", hex(section.address))
+                    put("fileOffset", section.offset)
+                    put("sizeBytes", section.size)
+                    put("link", section.link)
+                    put("entrySize", section.entrySize)
+                    put("fileRangeValid", section.type == 8L || validRange(section.offset, section.size))
+                })
+            }
+        }
+
+        val segments = ArrayList<ElfSegment>()
+        val segmentJson = JSONArray()
+        var invalidSegmentCount = 0
+        for (i in 0 until programCount.toInt()) {
+            val base = programOffset + i.toLong() * programEntrySize
+            val type = readValue(base, 4) ?: run { invalidSegmentCount++; continue }
+            val flags: Long
+            val offset: Long
+            val virtualAddress: Long
+            val fileSize: Long
+            val memorySize: Long
+            val alignment: Long
+            if (is64) {
+                flags = readValue(base + 4L, 4) ?: run { invalidSegmentCount++; continue }
+                offset = readValue(base + 8L, 8) ?: run { invalidSegmentCount++; continue }
+                virtualAddress = readValue(base + 16L, 8) ?: run { invalidSegmentCount++; continue }
+                fileSize = readValue(base + 32L, 8) ?: run { invalidSegmentCount++; continue }
+                memorySize = readValue(base + 40L, 8) ?: run { invalidSegmentCount++; continue }
+                alignment = readValue(base + 48L, 8) ?: run { invalidSegmentCount++; continue }
+            } else {
+                offset = readValue(base + 4L, 4) ?: run { invalidSegmentCount++; continue }
+                virtualAddress = readValue(base + 8L, 4) ?: run { invalidSegmentCount++; continue }
+                fileSize = readValue(base + 16L, 4) ?: run { invalidSegmentCount++; continue }
+                memorySize = readValue(base + 20L, 4) ?: run { invalidSegmentCount++; continue }
+                flags = readValue(base + 24L, 4) ?: run { invalidSegmentCount++; continue }
+                alignment = readValue(base + 28L, 4) ?: run { invalidSegmentCount++; continue }
+            }
+            val rangeValid = validRange(offset, fileSize)
+            if (!rangeValid || (type == 1L && fileSize > memorySize)) invalidSegmentCount++
+            val segment = ElfSegment(type, flags, offset, virtualAddress, fileSize, memorySize, alignment)
+            segments.add(segment)
+            if (segmentJson.length() < 100) {
+                segmentJson.put(JSONObject().apply {
+                    put("index", i)
+                    put("type", when (type) { 1L -> "LOAD"; 2L -> "DYNAMIC"; 3L -> "INTERP"; 4L -> "NOTE"; 6L -> "PHDR"; else -> "OTHER" })
+                    put("typeValue", type)
+                    put("flagsHex", hex(flags))
+                    put("fileOffset", offset)
+                    put("virtualAddress", hex(virtualAddress))
+                    put("fileSizeBytes", fileSize)
+                    put("memorySizeBytes", memorySize)
+                    put("alignment", alignment)
+                    put("fileRangeValid", rangeValid)
+                })
+            }
+        }
+
+        fun rvaToFileOffset(address: Long): Long? {
+            for (segment in segments) {
+                if (segment.type != 1L || segment.fileSize <= 0L || address < segment.virtualAddress) continue
+                val delta = address - segment.virtualAddress
+                if (delta >= 0L && delta < segment.fileSize &&
+                    segment.offset <= Long.MAX_VALUE - delta) {
+                    val candidate = segment.offset + delta
+                    if (validRange(candidate, 1L)) return candidate
+                }
+            }
+            return null
+        }
+
+        val symbols = ArrayList<ElfSymbol>()
+        var symbolTableCount = 0
+        var invalidSymbolTableCount = 0
+        val expectedSymbolSize = if (is64) 24L else 16L
+        for (section in sections) {
+            if (section.type != 2L && section.type != 11L) continue
+            symbolTableCount++
+            if (section.entrySize < expectedSymbolSize || section.entrySize <= 0L ||
+                section.link !in sections.indices.map { it.toLong() } ||
+                !validRange(section.offset, section.size)) {
+                invalidSymbolTableCount++
+                continue
+            }
+            val stringSection = sections[section.link.toInt()]
+            if (stringSection.type != 3L || !validRange(stringSection.offset, stringSection.size)) {
+                invalidSymbolTableCount++
+                continue
+            }
+            val recordCount = section.size / section.entrySize
+            if (recordCount > 100000L) {
+                invalidSymbolTableCount++
+                continue
+            }
+            for (symbolIndex in 0 until recordCount.toInt()) {
+                val base = section.offset + symbolIndex.toLong() * section.entrySize
+                val nameOffset = readValue(base, 4) ?: continue
+                val value: Long
+                val symbolSize: Long
+                val info: Long
+                if (is64) {
+                    info = readValue(base + 4L, 1) ?: continue
+                    value = readValue(base + 8L, 8) ?: continue
+                    symbolSize = readValue(base + 16L, 8) ?: continue
+                } else {
+                    value = readValue(base + 4L, 4) ?: continue
+                    symbolSize = readValue(base + 8L, 4) ?: continue
+                    info = readValue(base + 12L, 1) ?: continue
+                }
+                val name = cString(stringSection.offset, stringSection.size, nameOffset)
+                if (name.isNotBlank() && symbols.size < 100000) {
+                    symbols.add(ElfSymbol(
+                        name = name,
+                        value = value,
+                        size = symbolSize,
+                        fileOffset = if (value > 0L) rvaToFileOffset(value) else null,
+                        symbolType = (info.toInt() and 0x0f),
+                        binding = ((info.toInt() ushr 4) and 0x0f)
+                    ))
+                }
+            }
+        }
+
+        val symbolPreview = JSONArray()
+        symbols.take(150).forEach { symbol ->
+            symbolPreview.put(JSONObject().apply {
+                put("name", symbol.name)
+                put("type", symbolTypeName(symbol.symbolType))
+                put("binding", bindingName(symbol.binding))
+                put("value", hex(symbol.value))
+                put("rva", hex(symbol.value))
+                put("sizeBytes", symbol.size)
+                put("fileOffset", symbol.fileOffset?.let { hex(it) } ?: JSONObject.NULL)
             })
-            put("endianness", when (endian) { 1 -> "Little endian"; 2 -> "Big endian"; else -> "Unknown" })
-            put("type", u16(16))
-            put("machine", u16(18))
-            put("headerSizeBytes", if (b.getOrNull(4)?.toInt() == 2) 64 else 52)
+        }
+
+        val entryFileOffset = if (entry > 0L) rvaToFileOffset(entry) else null
+        val result = JSONObject().apply {
+            put("valid", invalidSectionCount == 0 && invalidSegmentCount == 0)
+            put("class", if (is64) "ELF64" else "ELF32")
+            put("endianness", if (littleEndian) "Little endian" else "Big endian")
+            put("type", when (fileType) { 1L -> "Relocatable"; 2L -> "Executable"; 3L -> "Shared object"; 4L -> "Core"; else -> "Unknown (" + fileType + ")" })
+            put("typeValue", fileType)
+            put("machine", machineName(machine))
+            put("machineValue", machine)
+            put("entryPoint", hex(entry))
+            put("entryPointFileOffset", entryFileOffset?.let { hex(it) } ?: JSONObject.NULL)
+            put("headerSizeBytes", readValue(if (is64) 52L else 40L, 2) ?: 0L)
+            put("programHeaderCount", programCount)
+            put("sectionHeaderCount", sectionCount)
+            put("sectionNameTableIndex", sectionNameIndex)
+            put("sectionNameTableValid", sectionNameTableValid)
+            put("sections", namedSections)
+            put("segments", segmentJson)
+            put("invalidSectionCount", invalidSectionCount)
+            put("invalidSegmentCount", invalidSegmentCount)
+            put("symbolTableCount", symbolTableCount)
+            put("invalidSymbolTableCount", invalidSymbolTableCount)
+            put("symbolCount", symbols.size)
+            put("symbolsPreview", symbolPreview)
+            put("symbolPreviewLimit", 150)
+            put("rvaMapping", "Static mapping through PT_LOAD segments: fileOffset = p_offset + (RVA - p_vaddr), when the address is file-backed.")
+            put("note", "Static ELF file analysis only. Stripped binaries may not contain useful symbol names. No process memory is read or modified.")
+        }
+        return ElfAnalysis(result, symbols)
+    }
+
+    private fun searchElfSymbols() {
+        val query = symbolSearch.text.toString().trim()
+        if (query.isEmpty()) {
+            output.text = "Aramak istediğin sembol adını yaz."
+            return
+        }
+        if (lastElfSymbols.isEmpty()) {
+            output.text = "Önce bir ELF .so dosyası seçip analiz et. Dosyada okunabilir sembol tablosu bulunması gerekir."
+            return
+        }
+        val matches = lastElfSymbols.filter { it.name.contains(query, ignoreCase = true) }.take(100)
+        output.text = buildString {
+            appendLine("ELF SEMBOL ARAMA")
+            appendLine("Arama: " + query)
+            appendLine("Eşleşme: " + matches.size + (if (matches.size == 100) " (ilk 100)" else ""))
+            appendLine()
+            if (matches.isEmpty()) {
+                appendLine("Eşleşen sembol bulunamadı. Bu dosya stripped olabilir veya sembol adı farklı olabilir.")
+            } else {
+                matches.forEach { symbol ->
+                    appendLine(symbol.name)
+                    appendLine("  Tür: " + when (symbol.symbolType) {
+                        0 -> "NOTYPE"; 1 -> "OBJECT"; 2 -> "FUNC"; 3 -> "SECTION"; 4 -> "FILE"; 6 -> "TLS"; else -> "UNKNOWN"
+                    })
+                    appendLine("  Binding: " + when (symbol.binding) {
+                        0 -> "LOCAL"; 1 -> "GLOBAL"; 2 -> "WEAK"; else -> "OTHER"
+                    })
+                    appendLine("  RVA: 0x" + java.lang.Long.toHexString(symbol.value))
+                    appendLine("  Dosya offseti: " + (symbol.fileOffset?.let { "0x" + java.lang.Long.toHexString(it) } ?: "PT_LOAD üzerinden eşleşmedi"))
+                    appendLine("  Boyut: " + symbol.size + " byte")
+                    appendLine()
+                }
+            }
         }
     }
+
 
     private fun readBounded(input: java.io.InputStream, limitBytes: Long): ByteArray {
         val output = java.io.ByteArrayOutputStream()
