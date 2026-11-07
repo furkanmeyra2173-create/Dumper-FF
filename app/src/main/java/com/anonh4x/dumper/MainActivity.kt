@@ -591,7 +591,31 @@ class MainActivity : Activity() {
         var invalidSegmentCount = 0
         for (i in 0 until programCount.toInt()) {
             val base = programOffset + i.toLong() * programEntrySize
-            val type = readValue(base, 4) ?: run { invalidSegmentCount++; continue }
+            val typeValue = readValue(base, 4)
+            val values = if (is64) {
+                listOf(
+                    readValue(base + 4L, 4),
+                    readValue(base + 8L, 8),
+                    readValue(base + 16L, 8),
+                    readValue(base + 32L, 8),
+                    readValue(base + 40L, 8),
+                    readValue(base + 48L, 8)
+                )
+            } else {
+                listOf(
+                    readValue(base + 24L, 4),
+                    readValue(base + 4L, 4),
+                    readValue(base + 8L, 4),
+                    readValue(base + 16L, 4),
+                    readValue(base + 20L, 4),
+                    readValue(base + 28L, 4)
+                )
+            }
+            if (typeValue == null || values.any { it == null }) {
+                invalidSegmentCount++
+                continue
+            }
+            val type = typeValue
             val flags: Long
             val offset: Long
             val virtualAddress: Long
@@ -599,19 +623,19 @@ class MainActivity : Activity() {
             val memorySize: Long
             val alignment: Long
             if (is64) {
-                flags = readValue(base + 4L, 4) ?: run { invalidSegmentCount++; continue }
-                offset = readValue(base + 8L, 8) ?: run { invalidSegmentCount++; continue }
-                virtualAddress = readValue(base + 16L, 8) ?: run { invalidSegmentCount++; continue }
-                fileSize = readValue(base + 32L, 8) ?: run { invalidSegmentCount++; continue }
-                memorySize = readValue(base + 40L, 8) ?: run { invalidSegmentCount++; continue }
-                alignment = readValue(base + 48L, 8) ?: run { invalidSegmentCount++; continue }
+                flags = values[0]!!
+                offset = values[1]!!
+                virtualAddress = values[2]!!
+                fileSize = values[3]!!
+                memorySize = values[4]!!
+                alignment = values[5]!!
             } else {
-                offset = readValue(base + 4L, 4) ?: run { invalidSegmentCount++; continue }
-                virtualAddress = readValue(base + 8L, 4) ?: run { invalidSegmentCount++; continue }
-                fileSize = readValue(base + 16L, 4) ?: run { invalidSegmentCount++; continue }
-                memorySize = readValue(base + 20L, 4) ?: run { invalidSegmentCount++; continue }
-                flags = readValue(base + 24L, 4) ?: run { invalidSegmentCount++; continue }
-                alignment = readValue(base + 28L, 4) ?: run { invalidSegmentCount++; continue }
+                offset = values[1]!!
+                virtualAddress = values[2]!!
+                fileSize = values[3]!!
+                memorySize = values[4]!!
+                flags = values[0]!!
+                alignment = values[5]!!
             }
             val rangeValid = validRange(offset, fileSize)
             if (!rangeValid || (type == 1L && fileSize > memorySize)) invalidSegmentCount++
