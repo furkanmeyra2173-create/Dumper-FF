@@ -30,6 +30,7 @@ class MainActivity : Activity() {
     private val pickFile = 4101
 
     private val maxSingleFileBytes = 300L * 1024L * 1024L
+    private val maxAnalyzeFileBytes = 256L * 1024L * 1024L
     private val maxTotalExtractBytes = 700L * 1024L * 1024L
     private val maxExtractedFiles = 500
 
@@ -106,11 +107,11 @@ class MainActivity : Activity() {
         }
         try {
             val name = queryName(uri)
-            val bytes = contentResolver.openInputStream(uri)?.use { it.readBytes() }
+            val bytes = contentResolver.openInputStream(uri)?.use { readBounded(it, maxAnalyzeFileBytes) }
                 ?: error("Dosya okunamadı.")
             val report = JSONObject().apply {
                 put("tool", "Dumper")
-                put("version", "0.2.0")
+                put("version", "0.3.0")
                 put("fileName", name)
                 put("sizeBytes", bytes.size)
                 put("analyzedAt", SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssXXX", Locale.US).format(Date()))
@@ -265,7 +266,7 @@ class MainActivity : Activity() {
             }
             val report = JSONObject().apply {
                 put("tool", "Dumper")
-                put("version", "0.2.0")
+                put("version", "0.3.0")
                 put("task", "apk-extraction")
                 put("sourceApk", apkName)
                 put("extractedAt", SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssXXX", Locale.US).format(Date()))
@@ -380,16 +381,212 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun readBounded(input: java.io.InputStream, limitBytes: Long): ByteArray {
+        val output = java.io.ByteArrayOutputStream()
+        val buffer = ByteArray(64 * 1024)
+        var total = 0L
+        while (true) {
+            val count = input.read(buffer)
+            if (count < 0) break
+            total += count.toLong()
+            if (total > limitBytes) {
+                throw IllegalArgumentException("Analiz dosyası " + formatBytes(limitBytes) + " sınırını aşıyor.")
+            }
+            output.write(buffer, 0, count)
+        }
+        return output.toByteArray()
+    }
+
     private fun metadataInfo(b: ByteArray): JSONObject {
+        val magicExpected = 0xFAB11BAFL
+        val tablesNames = listOf(
+            "stringLiterals", "stringLiteralData", "strings", "events", "properties",
+            "methods", "parameterDefaultValues", "fieldDefaultValues", "defaultValues",
+            "fieldAndParameterDefaultValueData", "fieldMarshaledSizes", "parameters",
+            "fields", "genericParameters", "genericParameterConstraints", "genericContainers",
+            "nestedTypes", "interfaces", "vtableMethods", "interfaceOffsets", "typeDefinitions",
+            "images", "assemblies", "metadataUsageLists", "metadataUsagePairs", "fieldRefs",
+            "referencedAssemblies", "attributesInfo", "attributeTypes",
+            "unresolvedVirtualCallParameterTypes", "unresolvedVirtualCallParameterRanges",
+            "windowsRuntimeTypeNames", "windowsRuntimeStrings", "exportedTypeDefinitions"
+        )
+
+        if (b.size < 16) {
+            return JSONObject().apply {
+                put("valid", false)
+                put("fileSizeBytes", b.size)
+                put("error", "Dosya metadata başlığı için çok kısa.")
+            }
+        }
+
         val view = java.nio.ByteBuffer.wrap(b).order(java.nio.ByteOrder.LITTLE_ENDIAN)
-        val magic = if (b.size >= 4) view.getInt(0) else 0
-        val version = if (b.size >= 8) view.getInt(4) else -1
+        val magic = view.getInt(0).toLong() and 0xffffffffL
+        val version = view.getInt(4)
+        val firstTableOffset = view.getInt(8)
+
+        if (magic != magicExpected) {
+            return JSONObject().apply {
+                put("valid", false)
+                put("magicHex", "0x%08X".format(Locale.US, magic))
+                put("versionCandidate", version)
+                put("fileSizeBytes", b.size)
+                put("error", "Unity IL2CPP metadata magic değeri eşleşmiyor.")
+            }
+        }
+
+        val headerShapeValid = firstTableOffset >= 16 &&
+            firstTableOffset <= b.size &&
+            (firstTableOffset - 8) % 8 == 0
+        if (!headerShapeValid) {
+            return JSONObject().apply {
+                put("valid", false)
+                put("magicHex", "0x%08X".format(Locale.US, magic))
+                put("versionCandidate", version)
+                put("firstTableOffset", firstTableOffset)
+                put("fileSizeBytes", b.size)
+                put("error", "İlk tablo ofseti geçerli bir metadata başlık uzunluğu oluşturmuyor.")
+            }
+        }
+
+        val pairCount = minOf(tablesNames.size, (firstTableOffset - 8) / 8)
+        val tableRanges = mutableListOf<LongArray>()
+        val tablesJson = JSONArray()
+        var invalidTableCount = 0
+
+        for (i in 0 until pairCount) {
+            val position = 8 + i * 8
+            val offset = view.getInt(position)
+            val sizeOrCount = view.getInt(position + 4)
+            val isCountField = i == 27 || i == 28
+            val rangeValid = offset >= 0 && sizeOrCount >= 0 &&
+                if (isCountField) {
+                    offset.toLong() <= b.size.toLong() && sizeOrCount <= 50_000_000
+                } else {
+                    offset.toLong() <= b.size.toLong() &&
+                        sizeOrCount.toLong() <= b.size.toLong() - offset.toLong()
+                }
+
+            if (!rangeValid) invalidTableCount++
+            tableRanges.add(longArrayOf(offset.toLong(), sizeOrCount.toLong()))
+            tablesJson.put(JSONObject().apply {
+                put("index", i)
+                put("name", tablesNames[i])
+                put("offset", offset)
+                put(if (isCountField) "count" else "sizeBytes", sizeOrCount)
+                put("rangeValid", rangeValid)
+            })
+        }
+
+        fun tableRange(index: Int): LongArray? {
+            if (index !in tableRanges.indices) return null
+            val values = tableRanges[index]
+            val offset = values[0]
+            val size = values[1]
+            if (offset < 0L || size < 0L || offset > b.size.toLong() ||
+                size > b.size.toLong() - offset) return null
+            return longArrayOf(offset, size)
+        }
+
+        val literalTable = tableRange(0)
+        val literalDataTable = tableRange(1)
+        val stringsTable = tableRange(2)
+        val coreTablesValid = literalTable != null && literalDataTable != null && stringsTable != null
+
+        val stringPoolJson = JSONObject()
+        if (stringsTable != null) {
+            val start = stringsTable[0].toInt()
+            val end = (stringsTable[0] + stringsTable[1]).toInt()
+            var cursor = start
+            var stringCount = 0
+            val preview = JSONArray()
+            while (cursor < end) {
+                var terminator = cursor
+                while (terminator < end && b[terminator] != 0.toByte()) terminator++
+                val length = terminator - cursor
+                if (length > 0) {
+                    stringCount++
+                    if (preview.length() < 80 && length <= 4096) {
+                        val value = String(b, cursor, length, Charsets.UTF_8)
+                        val printable = value.count {
+                            it == '\t' || it == '\n' || it == '\r' || it >= ' '
+                        }
+                        if (value.isNotBlank() && printable.toDouble() / value.length.toDouble() >= 0.85) {
+                            preview.put(if (value.length > 180) value.take(180) + "…" else value)
+                        }
+                    }
+                }
+                cursor = if (terminator < end) terminator + 1 else end
+            }
+            stringPoolJson.put("offset", start)
+            stringPoolJson.put("sizeBytes", stringsTable[1])
+            stringPoolJson.put("nonEmptyStringCount", stringCount)
+            stringPoolJson.put("preview", preview)
+        } else {
+            stringPoolJson.put("available", false)
+        }
+
+        val literalsJson = JSONObject()
+        if (literalTable != null && literalDataTable != null) {
+            val tableSize = literalTable[1]
+            val recordSize = 8L
+            var validLiteralCount = 0
+            val preview = JSONArray()
+            val records = tableSize / recordSize
+            for (i in 0 until minOf(records, 2_000_000L).toInt()) {
+                val recordPos = (literalTable[0] + i.toLong() * recordSize).toInt()
+                val length = view.getInt(recordPos)
+                val dataIndex = view.getInt(recordPos + 4)
+                val dataSize = literalDataTable[1]
+                val valid = length >= 0 && length <= 1_048_576 && dataIndex >= 0 &&
+                    dataIndex.toLong() <= dataSize && length.toLong() <= dataSize - dataIndex.toLong()
+                if (valid) {
+                    validLiteralCount++
+                    if (preview.length() < 40 && length > 0) {
+                        val stringStart = (literalDataTable[0] + dataIndex.toLong()).toInt()
+                        val value = String(b, stringStart, length, Charsets.UTF_8)
+                        val printable = value.count {
+                            it == '\t' || it == '\n' || it == '\r' || it >= ' '
+                        }
+                        if (value.isNotBlank() && printable.toDouble() / value.length.toDouble() >= 0.85) {
+                            preview.put(if (value.length > 180) value.take(180) + "…" else value)
+                        }
+                    }
+                }
+            }
+            literalsJson.put("recordSizeBytes", recordSize)
+            literalsJson.put("tableSizeBytes", tableSize)
+            literalsJson.put("tableAligned", tableSize % recordSize == 0L)
+            literalsJson.put("recordCount", records)
+            literalsJson.put("validRecordCount", validLiteralCount)
+            literalsJson.put("preview", preview)
+        } else {
+            literalsJson.put("available", false)
+        }
+
         return JSONObject().apply {
+            put("valid", coreTablesValid && invalidTableCount == 0)
             put("magicHex", "0x%08X".format(Locale.US, magic))
-            put("versionCandidate", version)
-            put("headerBytesAvailable", minOf(b.size, 8))
+            put("version", version)
+            put("knownVersionRange", version in 16..31)
             put("fileSizeBytes", b.size)
-            put("warning", "Header candidate only; full metadata layout validation is not implemented yet.")
+            put("headerBytes", firstTableOffset)
+            put("headerPairCount", pairCount)
+            put("tableDirectory", tablesJson)
+            put("invalidTableRangeCount", invalidTableCount)
+            put("stringPool", stringPoolJson)
+            put("stringLiterals", literalsJson)
+            put("parserStage", "Header validation, table directory, UTF-8 string pool and string literal records")
+            put("decodedTypes", 0)
+            put("decodedMethods", 0)
+            put("decodedFields", 0)
+            put("note", "This build reads static metadata tables and strings only. Type/method/field record decoding is not yet enabled; no live process memory or protected app data is accessed.")
+            if (!coreTablesValid) {
+                put("warning", "One or more required core table ranges are invalid.")
+            } else if (version !in 16..31) {
+                put("warning", "Metadata version is outside the currently recognized version range; table layout needs additional verification.")
+            } else if (invalidTableCount > 0) {
+                put("warning", "Some optional table ranges are invalid and were marked in tableDirectory.")
+            }
         }
     }
 
